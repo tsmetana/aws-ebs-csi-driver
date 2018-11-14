@@ -22,6 +22,7 @@ import (
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
 	"google.golang.org/grpc/codes"
@@ -104,6 +105,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		Encrypted:        isEncrypted,
 		KmsKeyID:         kmsKeyId,
 	}
+
+	// Shall we restore a snapshot?
+	volumeSource := req.GetVolumeContentSource()
+	if volumeSource != nil {
+		if _, ok := volumeSource.GetType().(*csi.VolumeContentSource_Snapshot); ok != true {
+			return nil, status.Error(codes.InvalidArgument, "Unsupported volumeContentSource type")
+		}
+		sourceSnapshot := volumeSource.GetSnapshot()
+		if sourceSnapshot == nil {
+			return nil, status.Error(codes.InvalidArgument, "Error retrieving snapshot from the volumeContentSource")
+		}
+		opts.SnapshotID = sourceSnapshot.GetSnapshotId()
+	}
+
 	disk, err = d.cloud.CreateDisk(ctx, volName, opts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not create volume %q: %v", volName, err)
@@ -271,11 +286,57 @@ func (d *Driver) isValidVolumeCapabilities(volCaps []*csi.VolumeCapability) bool
 }
 
 func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	glog.V(4).Infof("CreateSnapshot: called with args %#v", req)
+	snapshotName := req.GetName()
+	if len(snapshotName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot name not provided")
+	}
+
+	volumeID := req.GetSourceVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot volume source ID not provided")
+	}
+	snapshot, err := d.cloud.GetSnapshotByName(ctx, snapshotName)
+	if err != nil && err != cloud.ErrNotFound {
+		return nil, err
+	}
+	if snapshot != nil {
+		if snapshot.SourceVolumeID != volumeID {
+			return nil, status.Errorf(codes.AlreadyExists, "Snapshot %s already exists for different volume (%s)", snapshotName, snapshot.SourceVolumeID)
+		} else {
+			glog.Infof("Snapshot %s of volume %s already exists; nothing to do", snapshotName, volumeID)
+			csiSnapshot, err := newCreateSnapshotResponse(snapshot)
+			return csiSnapshot, err
+		}
+	}
+	opts := &cloud.SnapshotOptions{
+		Tags: map[string]string{cloud.SnapshotNameTagKey: snapshotName},
+	}
+	snapshot, err = d.cloud.CreateSnapshot(ctx, volumeID, opts)
+
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not create snapshot %q: %v", snapshotName, err)
+	}
+	csiSnapshot, err := newCreateSnapshotResponse(snapshot)
+	return csiSnapshot, err
 }
 
 func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	glog.V(4).Infof("DeleteSnapshot: called with args %#v", req)
+	snapshotID := req.GetSnapshotId()
+	if len(snapshotID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot ID not provided")
+	}
+
+	if _, err := d.cloud.DeleteSnapshot(ctx, snapshotID); err != nil {
+		if err == cloud.ErrNotFound {
+			glog.V(4).Info("DeleteSnapshot: snapshot not found, returning with success")
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "Could not delete snapshot ID %q: %v", snapshotID, err)
+	}
+
+	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
@@ -318,4 +379,20 @@ func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
 			},
 		},
 	}
+}
+
+func newCreateSnapshotResponse(snapshot *cloud.Snapshot) (*csi.CreateSnapshotResponse, error) {
+	ts, err := ptypes.TimestampProto(snapshot.CreationTime)
+	if err != nil {
+		return nil, err
+	}
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SnapshotId:     snapshot.SnapshotID,
+			SourceVolumeId: snapshot.SourceVolumeID,
+			SizeBytes:      snapshot.Size,
+			CreationTime:   ts,
+			ReadyToUse:     true, // In AWS it's eiter this or error
+		},
+	}, nil
 }
