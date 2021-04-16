@@ -22,6 +22,7 @@ import (
 	"net"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
 	"google.golang.org/grpc"
 	"k8s.io/klog"
@@ -49,6 +50,8 @@ const (
 	WellKnownTopologyKey = "topology.kubernetes.io/zone"
 	// DEPRECATED Use the WellKnownTopologyKey instead
 	TopologyKey = "topology." + DriverName + "/zone"
+
+	ProbeCSIFullMethod = "/csi.v1.Identity/Probe"
 )
 
 type Driver struct {
@@ -112,7 +115,11 @@ func (d *Driver) Run() error {
 		return err
 	}
 
-	logErr := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	logGRPC := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if info.FullMethod == ProbeCSIFullMethod {
+			return handler(ctx, req)
+		}
+		klog.V(4).Infof("%s called with args: %s", info.FullMethod, protosanitizer.StripSecrets(req))
 		resp, err := handler(ctx, req)
 		if err != nil {
 			klog.Errorf("GRPC error: %v", err)
@@ -120,7 +127,7 @@ func (d *Driver) Run() error {
 		return resp, err
 	}
 	opts := []grpc.ServerOption{
-		grpc.UnaryInterceptor(logErr),
+		grpc.UnaryInterceptor(logGRPC),
 	}
 	d.srv = grpc.NewServer(opts...)
 
